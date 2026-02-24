@@ -20,9 +20,10 @@ import pandas as pd
 
 SENDER_EMAIL = "peter.vandeventer@thungela.com"
 
-# If you have multiple Outlook accounts/mailboxes, set this to the mailbox
-# you want to search.  Set to None to use the default mailbox.
-TARGET_MAILBOX = "lion.steynberg@thungela.com"
+# Outlook folder path — each level separated by a backslash.
+# This maps to: \\lion.steynberg@Thungela.com\ASR Department\Peter Van Devenenter
+MAILBOX_NAME = "lion.steynberg@Thungela.com"
+FOLDER_PATH = ["ASR Department", "Peter Van Devenenter"]
 
 # Excel parsing settings
 HEADER_ROW = 2          # 0-indexed: row 3 in the file = index 2
@@ -34,66 +35,77 @@ ATTACHMENT_DIR = "downloaded_attachments"
 # ── Outlook COM helpers ──────────────────────────────────────────────────────
 
 
-def get_inbox(target_mailbox: str | None = None):
+def get_target_folder(mailbox_name: str, folder_path: list[str]):
     """
-    Connect to Outlook via COM and return the Inbox folder.
-    If target_mailbox is set, find that specific account's inbox.
+    Connect to Outlook via COM and navigate to a specific folder.
+    E.g. mailbox_name="lion.steynberg@Thungela.com",
+         folder_path=["ASR Department", "Peter Van Devenenter"]
+    navigates to \\lion.steynberg@Thungela.com\ASR Department\Peter Van Devenenter
     """
     outlook = win32com.client.Dispatch("Outlook.Application")
     namespace = outlook.GetNamespace("MAPI")
 
-    if target_mailbox:
-        # Search through all accounts for the matching mailbox
+    # Find the mailbox store (case-insensitive)
+    root = None
+    for store in namespace.Stores:
+        if store.DisplayName.lower() == mailbox_name.lower():
+            root = store.GetRootFolder()
+            print(f"Found mailbox: {store.DisplayName}")
+            break
+
+    if root is None:
+        # Try partial match
         for store in namespace.Stores:
-            if store.DisplayName.lower() == target_mailbox.lower():
+            if mailbox_name.lower() in store.DisplayName.lower():
                 root = store.GetRootFolder()
-                # Navigate to Inbox subfolder
-                for folder in root.Folders:
-                    if folder.Name.lower() == "inbox":
-                        print(f"Using mailbox: {store.DisplayName}")
-                        return folder
-        # If exact match failed, try partial match on email
-        for store in namespace.Stores:
-            if target_mailbox.lower() in store.DisplayName.lower():
-                root = store.GetRootFolder()
-                for folder in root.Folders:
-                    if folder.Name.lower() == "inbox":
-                        print(f"Using mailbox: {store.DisplayName}")
-                        return folder
-        print(
-            f"WARNING: Could not find mailbox '{target_mailbox}'. "
-            f"Falling back to default Inbox."
+                print(f"Found mailbox (partial match): {store.DisplayName}")
+                break
+
+    if root is None:
+        available = [s.DisplayName for s in namespace.Stores]
+        raise RuntimeError(
+            f"Could not find mailbox '{mailbox_name}'.\n"
+            f"Available stores: {available}"
         )
 
-    # Default inbox
-    inbox = namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
-    print(f"Using default Inbox: {inbox.Parent.Name}")
-    return inbox
+    # Walk down the subfolder path
+    current = root
+    for subfolder_name in folder_path:
+        found = False
+        for folder in current.Folders:
+            if folder.Name.lower() == subfolder_name.lower():
+                current = folder
+                found = True
+                break
+        if not found:
+            available = [f.Name for f in current.Folders]
+            raise RuntimeError(
+                f"Could not find subfolder '{subfolder_name}' "
+                f"inside '{current.Name}'.\n"
+                f"Available subfolders: {available}"
+            )
+
+    print(f"Using folder: {current.FolderPath}")
+    return current
 
 
-def get_messages_from_sender(inbox, sender_email: str) -> list:
+def get_messages_with_attachments(folder) -> list:
     """
-    Filter inbox for messages from the target sender that have attachments.
-    Returns a list of (mail_item, received_datetime) tuples sorted oldest-first.
+    Get all messages in the folder that have attachments.
+    Returns a list sorted oldest-first so dedup keeps the newest.
     """
-    messages = inbox.Items
-    # Restrict to the sender — DASL filter is most reliable for email address
-    filter_str = (
-        "@SQL=\"urn:schemas:httpmail:fromemail\" = "
-        f"'{sender_email}'"
-    )
-    filtered = messages.Restrict(filter_str)
-
+    messages = folder.Items
     results = []
-    for i in range(filtered.Count, 0, -1):
-        item = filtered.Item(i)
+
+    for i in range(messages.Count, 0, -1):
+        item = messages.Item(i)
         if item.Attachments.Count > 0:
             results.append(item)
 
     # Sort oldest → newest so dedup keeps the newest
     results.sort(key=lambda m: m.ReceivedTime)
 
-    print(f"Found {len(results)} message(s) from {sender_email} with attachments.")
+    print(f"Found {len(results)} message(s) with attachments in folder.")
     return results
 
 
@@ -196,13 +208,13 @@ def consolidate(files: list[Path]) -> pd.DataFrame:
 def main():
     print("=== Outlook Attachment Downloader & Consolidator ===\n")
 
-    # 1. Connect to Outlook
+    # 1. Connect to Outlook and navigate to the target folder
     print("Connecting to Outlook...")
-    inbox = get_inbox(TARGET_MAILBOX)
+    folder = get_target_folder(MAILBOX_NAME, FOLDER_PATH)
 
-    # 2. Find emails from the sender
+    # 2. Find emails with attachments in the folder
     print("\nSearching for messages...")
-    messages = get_messages_from_sender(inbox, SENDER_EMAIL)
+    messages = get_messages_with_attachments(folder)
 
     if not messages:
         print("No messages found. Exiting.")
