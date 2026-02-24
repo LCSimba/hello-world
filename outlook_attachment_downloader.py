@@ -1,153 +1,123 @@
 """
 Outlook Attachment Downloader & Excel Consolidator
 ===================================================
-Downloads Excel attachments from a specific sender via Microsoft Graph API,
-combines them into one deduplicated table, and saves the result.
+Uses win32com.client to connect to a local Outlook instance, downloads
+Excel attachments from a specific sender, combines them into one
+deduplicated table, and saves the result.
 
-Prerequisites:
-    pip install msal requests pandas openpyxl
-
-Setup:
-    1. Register an app in Azure AD (portal.azure.com > App registrations).
-    2. Set a **Mobile/Desktop** redirect URI to http://localhost .
-    3. Under API Permissions, add Microsoft Graph > Delegated:
-         - Mail.Read
-    4. Copy your Application (client) ID and Tenant ID into the config below.
+Prerequisites (run on Windows with Outlook installed):
+    pip install pywin32 pandas openpyxl
 """
 
 import os
-import tempfile
 from pathlib import Path
+from datetime import datetime
 
-import msal
-import requests
+import win32com.client
 import pandas as pd
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-# Azure AD app registration details — fill these in
-CLIENT_ID = "YOUR_CLIENT_ID"           # Application (client) ID
-TENANT_ID = "YOUR_TENANT_ID"           # Directory (tenant) ID
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-
-# Microsoft Graph scopes
-SCOPES = ["Mail.Read"]
-
-# Mail filter settings
-MAILBOX_USER = "lion.steynberg@thungela.com"  # your mailbox
 SENDER_EMAIL = "peter.vandeventer@thungela.com"
+
+# If you have multiple Outlook accounts/mailboxes, set this to the mailbox
+# you want to search.  Set to None to use the default mailbox.
+TARGET_MAILBOX = "lion.steynberg@thungela.com"
 
 # Excel parsing settings
 HEADER_ROW = 2          # 0-indexed: row 3 in the file = index 2
-MAX_BLANK_ROWS = 5      # blank rows to expect and remove
 
 # Output
 OUTPUT_FILE = "consolidated_output.xlsx"
 ATTACHMENT_DIR = "downloaded_attachments"
 
-# ── Authentication ───────────────────────────────────────────────────────────
+# ── Outlook COM helpers ──────────────────────────────────────────────────────
 
-def get_access_token() -> str:
-    """Authenticate interactively via browser and return an access token."""
 
-    # Token cache so you don't re-auth every run
-    cache = msal.SerializableTokenCache()
-    cache_file = Path(".token_cache.bin")
-    if cache_file.exists():
-        cache.deserialize(cache_file.read_text())
+def get_inbox(target_mailbox: str | None = None):
+    """
+    Connect to Outlook via COM and return the Inbox folder.
+    If target_mailbox is set, find that specific account's inbox.
+    """
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
 
-    app = msal.PublicClientApplication(
-        CLIENT_ID,
-        authority=AUTHORITY,
-        token_cache=cache,
-    )
-
-    # Try silent token acquisition first
-    accounts = app.get_accounts()
-    result = None
-    if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
-
-    # Fall back to interactive browser login
-    if not result:
-        result = app.acquire_token_interactive(scopes=SCOPES)
-
-    # Persist cache
-    if cache.has_state_changed:
-        cache_file.write_text(cache.serialize())
-
-    if "access_token" not in result:
-        raise RuntimeError(
-            f"Authentication failed: {result.get('error_description', result)}"
+    if target_mailbox:
+        # Search through all accounts for the matching mailbox
+        for store in namespace.Stores:
+            if store.DisplayName.lower() == target_mailbox.lower():
+                root = store.GetRootFolder()
+                # Navigate to Inbox subfolder
+                for folder in root.Folders:
+                    if folder.Name.lower() == "inbox":
+                        print(f"Using mailbox: {store.DisplayName}")
+                        return folder
+        # If exact match failed, try partial match on email
+        for store in namespace.Stores:
+            if target_mailbox.lower() in store.DisplayName.lower():
+                root = store.GetRootFolder()
+                for folder in root.Folders:
+                    if folder.Name.lower() == "inbox":
+                        print(f"Using mailbox: {store.DisplayName}")
+                        return folder
+        print(
+            f"WARNING: Could not find mailbox '{target_mailbox}'. "
+            f"Falling back to default Inbox."
         )
 
-    return result["access_token"]
+    # Default inbox
+    inbox = namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
+    print(f"Using default Inbox: {inbox.Parent.Name}")
+    return inbox
 
 
-# ── Graph API helpers ────────────────────────────────────────────────────────
-
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-
-
-def get_messages_from_sender(token: str) -> list[dict]:
-    """Fetch all messages from the target sender that have attachments."""
-
-    headers = {"Authorization": f"Bearer {token}"}
-    messages = []
-    # Filter: from the sender AND has attachments AND attachment is xlsx/xls
-    filter_query = (
-        f"from/emailAddress/address eq '{SENDER_EMAIL}' "
-        f"and hasAttachments eq true"
+def get_messages_from_sender(inbox, sender_email: str) -> list:
+    """
+    Filter inbox for messages from the target sender that have attachments.
+    Returns a list of (mail_item, received_datetime) tuples sorted oldest-first.
+    """
+    messages = inbox.Items
+    # Restrict to the sender — DASL filter is most reliable for email address
+    filter_str = (
+        "@SQL=\"urn:schemas:httpmail:fromemail\" = "
+        f"'{sender_email}'"
     )
-    url = (
-        f"{GRAPH_BASE}/me/messages"
-        f"?$filter={filter_query}"
-        f"&$select=id,subject,receivedDateTime,hasAttachments"
-        f"&$orderby=receivedDateTime desc"
-        f"&$top=100"
-    )
+    filtered = messages.Restrict(filter_str)
 
-    while url:
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        messages.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")  # pagination
+    results = []
+    for i in range(filtered.Count, 0, -1):
+        item = filtered.Item(i)
+        if item.Attachments.Count > 0:
+            results.append(item)
 
-    print(f"Found {len(messages)} message(s) from {SENDER_EMAIL} with attachments.")
-    return messages
+    # Sort oldest → newest so dedup keeps the newest
+    results.sort(key=lambda m: m.ReceivedTime)
+
+    print(f"Found {len(results)} message(s) from {sender_email} with attachments.")
+    return results
 
 
-def download_excel_attachments(token: str, messages: list[dict]) -> list[Path]:
-    """Download all .xlsx/.xls attachments and return their local paths."""
-
-    headers = {"Authorization": f"Bearer {token}"}
+def download_excel_attachments(messages: list) -> list[Path]:
+    """Save all .xlsx/.xls attachments from the messages to disk."""
     os.makedirs(ATTACHMENT_DIR, exist_ok=True)
     downloaded = []
 
     for msg in messages:
-        msg_id = msg["id"]
-        received = msg["receivedDateTime"]
-        subject = msg.get("subject", "no_subject")
+        received_dt = msg.ReceivedTime
+        # Format date for file prefix: YYYY-MM-DD
+        date_prefix = received_dt.strftime("%Y-%m-%d")
+        subject = msg.Subject or "no_subject"
 
-        att_url = f"{GRAPH_BASE}/me/messages/{msg_id}/attachments"
-        resp = requests.get(att_url, headers=headers, timeout=30)
-        resp.raise_for_status()
+        for j in range(1, msg.Attachments.Count + 1):
+            att = msg.Attachments.Item(j)
+            name = att.FileName
 
-        for att in resp.json().get("value", []):
-            name = att.get("name", "")
             if not name.lower().endswith((".xlsx", ".xls")):
                 continue
 
-            # Prefix with date for traceability
-            safe_date = received[:10]
-            safe_name = f"{safe_date}__{name}"
+            safe_name = f"{date_prefix}__{name}"
             dest = Path(ATTACHMENT_DIR) / safe_name
-
-            # Write the attachment bytes
-            import base64
-            content_bytes = base64.b64decode(att["contentBytes"])
-            dest.write_bytes(content_bytes)
+            att.SaveAsFile(str(dest.resolve()))
             downloaded.append(dest)
             print(f"  Downloaded: {dest}")
 
@@ -157,11 +127,12 @@ def download_excel_attachments(token: str, messages: list[dict]) -> list[Path]:
 
 # ── Excel processing ─────────────────────────────────────────────────────────
 
+
 def read_and_clean(filepath: Path) -> pd.DataFrame:
     """
-    Read a single Excel file with:
+    Read a single Excel file:
       - headers on row 3 (0-indexed row 2)
-      - up to 5 blank rows removed
+      - drop fully blank rows (up to 5 or more)
     """
     df = pd.read_excel(filepath, header=HEADER_ROW, engine="openpyxl")
 
@@ -170,14 +141,16 @@ def read_and_clean(filepath: Path) -> pd.DataFrame:
 
     # Strip whitespace from string columns
     str_cols = df.select_dtypes(include="object").columns
-    df[str_cols] = df[str_cols].apply(lambda c: c.str.strip() if c.dtype == "object" else c)
+    df[str_cols] = df[str_cols].apply(
+        lambda c: c.str.strip() if c.dtype == "object" else c
+    )
 
     # Drop rows where every value is empty string after stripping
     df = df[~(df.astype(str).apply(lambda r: r.str.strip().eq("")).all(axis=1))]
 
     df.reset_index(drop=True, inplace=True)
 
-    # Tag with source file for debugging
+    # Tag with source file so dedup can prefer newer files
     df["_source_file"] = filepath.name
 
     return df
@@ -202,12 +175,12 @@ def consolidate(files: list[Path]) -> pd.DataFrame:
     print(f"\nCombined shape before dedup: {combined.shape}")
 
     # ── Deduplication ────────────────────────────────────────────────────
-    # Strategy: identify the "real" data columns (exclude our metadata col),
-    # then drop duplicates keeping the LAST occurrence.  Because files are
-    # sorted by date prefix (oldest first), the last occurrence = most recent.
+    # Data columns = everything except our internal tag
     data_cols = [c for c in combined.columns if not c.startswith("_")]
 
-    combined.sort_values("_source_file", inplace=True)  # oldest file first
+    # Files are sorted by date prefix (oldest first), so keeping "last"
+    # means the most recent version of a duplicated row is retained.
+    combined.sort_values("_source_file", inplace=True)
     combined.drop_duplicates(subset=data_cols, keep="last", inplace=True)
 
     combined.drop(columns=["_source_file"], inplace=True)
@@ -219,16 +192,17 @@ def consolidate(files: list[Path]) -> pd.DataFrame:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+
 def main():
     print("=== Outlook Attachment Downloader & Consolidator ===\n")
 
-    # 1. Authenticate
-    print("Authenticating...")
-    token = get_access_token()
+    # 1. Connect to Outlook
+    print("Connecting to Outlook...")
+    inbox = get_inbox(TARGET_MAILBOX)
 
-    # 2. Fetch messages
-    print("\nFetching messages...")
-    messages = get_messages_from_sender(token)
+    # 2. Find emails from the sender
+    print("\nSearching for messages...")
+    messages = get_messages_from_sender(inbox, SENDER_EMAIL)
 
     if not messages:
         print("No messages found. Exiting.")
@@ -236,13 +210,13 @@ def main():
 
     # 3. Download attachments
     print("\nDownloading attachments...")
-    files = download_excel_attachments(token, messages)
+    files = download_excel_attachments(messages)
 
     if not files:
         print("No Excel attachments found. Exiting.")
         return
 
-    # 4. Consolidate
+    # 4. Consolidate into one table
     print("\nConsolidating Excel files...")
     result = consolidate(files)
 
